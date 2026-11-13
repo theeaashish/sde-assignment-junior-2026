@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -107,6 +108,7 @@ class Database:
         self.db_path = str(db_path)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self.conn = self._connect()
         self.init_schema()
 
@@ -123,7 +125,8 @@ class Database:
         return conn
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def __enter__(self) -> Self:
         return self
@@ -138,15 +141,16 @@ class Database:
 
     @contextmanager
     def write_tx(self) -> Generator[sqlite3.Connection, None, None]:
-        # BEGIN IMMEDIATE acquires a write lock upfront to serialize reservations
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-            self.conn.execute("COMMIT")
-        except Exception:
-            if self.conn.in_transaction:
-                self.conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            # BEGIN IMMEDIATE acquires a write lock upfront to serialize reservations
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.conn
+                self.conn.execute("COMMIT")
+            except Exception:
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")
+                raise
 
     def init_schema(self) -> None:
         with self.write_tx() as conn:
@@ -156,17 +160,20 @@ class Database:
     def _one(
         self, sql: str, params: Sequence[Any], factory: Callable[[sqlite3.Row], T]
     ) -> T | None:
-        row = self.conn.execute(sql, params).fetchone()
-        return factory(row) if row is not None else None
+        with self._lock:
+            row = self.conn.execute(sql, params).fetchone()
+            return factory(row) if row is not None else None
 
     def _many(
         self, sql: str, params: Sequence[Any], factory: Callable[[sqlite3.Row], T]
     ) -> list[T]:
-        return [factory(row) for row in self.conn.execute(sql, params).fetchall()]
+        with self._lock:
+            return [factory(row) for row in self.conn.execute(sql, params).fetchall()]
 
     def _scalar(self, sql: str, params: Sequence[Any] = ()) -> int:
-        row = self.conn.execute(sql, params).fetchone()
-        return int(row[0]) if row else 0
+        with self._lock:
+            row = self.conn.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
 
     def get_config(self) -> GlobalConfig | None:
         return self._one("SELECT * FROM config WHERE id = 1", (), GlobalConfig.from_row)
@@ -253,3 +260,27 @@ class Database:
             )
             == 1
         )
+
+    def leads_by_campaign_and_state(self) -> dict[str, dict[str, int]]:
+        rows = self._many(
+            "SELECT campaign_id, state, COUNT(*) AS count FROM leads "
+            "GROUP BY campaign_id, state ORDER BY campaign_id, state",
+            (),
+            lambda row: (row["campaign_id"], row["state"], row["count"]),
+        )
+        grouped: dict[str, dict[str, int]] = {}
+        for campaign_id, state, count in rows:
+            grouped.setdefault(campaign_id, {})[state] = count
+        return grouped
+
+    def active_calls_by_tenant(self) -> dict[str, int]:
+        rows = self._many(
+            "SELECT tenant_id, COUNT(*) AS count FROM leads "
+            "WHERE state IN ('RESERVING', 'ACTIVE') GROUP BY tenant_id",
+            (),
+            lambda row: (row["tenant_id"], row["count"]),
+        )
+        return dict(rows)
+
+    def count_dnd_phones(self) -> int:
+        return self._scalar("SELECT COUNT(*) FROM dnd_phones")
