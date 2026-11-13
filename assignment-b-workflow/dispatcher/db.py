@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import json
 import sqlite3
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
@@ -154,98 +152,6 @@ class Database:
         with self.write_tx() as conn:
             for stmt in SCHEMA_STATEMENTS:
                 conn.execute(stmt)
-
-    def load_fixtures(self, campaigns_json_path: str | Path) -> dict[str, int]:
-        path = Path(campaigns_json_path)
-        if not path.is_absolute() and not path.exists():
-            candidate = Path("assignment-b-workflow") / path
-            if candidate.exists():
-                path = candidate
-            else:
-                candidate2 = Path(__file__).resolve().parent.parent / path
-                if candidate2.exists():
-                    path = candidate2
-        path = path.resolve()
-        base_dir = path.parent
-        with path.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        with self.write_tx() as conn:
-            rw = cfg["regulatory_window"]
-            rp = cfg["retry_policy"]
-            cfg_count = conn.execute(
-                """
-                INSERT OR IGNORE INTO config (
-                    id, sim_start, regulatory_start, regulatory_end,
-                    window_grace_seconds, retry_no_answer_minutes, retry_busy_minutes,
-                    retry_failed_minutes, webhook_secret
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    cfg["sim_start"],
-                    rw["start"],
-                    rw["end"],
-                    cfg.get("window_grace_seconds", 120),
-                    rp["no_answer_minutes"],
-                    rp["busy_minutes"],
-                    rp["failed_minutes"],
-                    cfg["webhook_secret"],
-                ),
-            ).rowcount
-
-            tenant_count = sum(
-                conn.execute(
-                    "INSERT OR IGNORE INTO tenants (tenant_id, max_concurrent_calls) VALUES (?, ?)",
-                    (t["tenant_id"], t["max_concurrent_calls"]),
-                ).rowcount
-                for t in cfg.get("tenants", [])
-            )
-
-            campaign_count = 0
-            lead_count = 0
-            for c in cfg.get("campaigns", []):
-                campaign_count += conn.execute(
-                    """
-                    INSERT OR IGNORE INTO campaigns (
-                        campaign_id, tenant_id, window_start, window_end,
-                        window_days_json, max_attempts, leads_file
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        c["campaign_id"],
-                        c["tenant_id"],
-                        c["window"]["start"],
-                        c["window"]["end"],
-                        json.dumps(c["window"]["days"]),
-                        c["max_attempts"],
-                        c["leads_file"],
-                    ),
-                ).rowcount
-
-                with (base_dir / c["leads_file"]).open("r", encoding="utf-8") as lf:
-                    for row in csv.DictReader(lf):
-                        lead_count += conn.execute(
-                            """
-                            INSERT OR IGNORE INTO leads (
-                                campaign_id, lead_id, tenant_id, phone,
-                                state, priority, attempts, dispatch_seq,
-                                last_status, last_disposition
-                            ) VALUES (?, ?, ?, ?, 'FRESH', 3, 0, 0, '', '')
-                            """,
-                            (
-                                c["campaign_id"],
-                                row["lead_id"],
-                                c["tenant_id"],
-                                row["phone"],
-                            ),
-                        ).rowcount
-
-        return {
-            "config": cfg_count,
-            "tenants": tenant_count,
-            "campaigns": campaign_count,
-            "leads": lead_count,
-        }
 
     def _one(
         self, sql: str, params: Sequence[Any], factory: Callable[[sqlite3.Row], T]
